@@ -1,6 +1,6 @@
 """Invariants of the tool registry — properties that must hold for the bridge
 to behave correctly."""
-from bridge.tools import SPECS_BY_NAME, TOOL_SPECS
+from actionauth.tools import SPECS_BY_NAME, TOOL_SPECS
 
 
 def test_no_duplicate_names():

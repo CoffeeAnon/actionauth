@@ -1,12 +1,12 @@
 """End-to-end: parameter-binding through three independent enforcement layers.
 
 ``docs/architecture.md`` commits the Tier-2 architecture to three layers:
-  1. Vault verifies the human's signature BEFORE minting.
+  1. delegation authority verifies the human's signature BEFORE minting.
   2. The bridge cannot alter the minted claim (it forwards the JWT unchanged).
   3. The resource server validates the minted JWT's authorization_details
      against the LIVE request, with its own consumed-jti state.
 
-These tests exercise each layer through real code paths. The Vault and the
+These tests exercise each layer through real code paths. The delegation authority and the
 ResourceServer are separate objects with separate state; the dispatcher
 forwards credentials from one to the other without modification.
 
@@ -15,35 +15,50 @@ enforcement layers" claim is broken.
 """
 import pytest
 
-from bridge.core.client import InMemoryTaskStore
-from bridge.core.dispatcher import ApprovalRequired, CommandSuccess, Dispatcher
-from bridge.rs import JwtResourceServer
-from bridge.vault import (
-    OAuthVault,
+from actionauth.core.client import InMemoryTaskStore
+from actionauth.core.dispatcher import ApprovalRequired, CommandSuccess, Dispatcher
+from actionauth.rs import JwtResourceServer
+from actionauth.authority import (
+    OAuthAuthority,
     sign_authorization_details,
 )
+from actionauth.authority.durable_state import DurableReplayState
 
 
 USER_SECRET = "test-user-secret-32bytes-minimum-pad"
 MINT_SECRET = "test-mint-secret-32bytes-minimum-pad"
-ISSUER = "https://vault.reference.invalid"
+ISSUER = "https://authority.reference.invalid"
 AUDIENCE = "bridge-resource-server"
 RAR_TYPE = "tasktracker_task_action"
 
 
 @pytest.fixture
 def separated_setup():
-    """Vault, RS, and dispatcher wired in the three-layer shape."""
+    """delegation authority, RS, and dispatcher wired in the three-layer shape.
+
+    The three independent enforcement layers require the delegation authority and the
+    Resource Server to keep *separate* single-use state. The state rework
+    dropped the components' private in-process sets in favour
+    of an injected StateBackend, so this fixture injects a dedicated
+    :class:`DurableReplayState` per component: the delegation authority's consumed-jti
+    table and the RS's consumed-jti table are different objects. The
+    dispatcher forwards credentials from one to the other unchanged.
+    ``:memory:`` is a fresh empty database per construction, so the two
+    backends share nothing and each test gets its own isolated state.
+    """
     client = InMemoryTaskStore()
     promised = client.create(title="Q2 launch checklist")
     bystander = client.create(title="Q3 onboarding doc")
 
-    vault = OAuthVault(
+    authority_state = DurableReplayState(":memory:")
+    rs_state = DurableReplayState(":memory:")
+    authority = OAuthAuthority(
         user_signing_secret=USER_SECRET,
         mint_secret=MINT_SECRET,
         issuer=ISSUER,
         audience=AUDIENCE,
         expected_rar_type=RAR_TYPE,
+        durable_state=authority_state,
     )
     rs = JwtResourceServer(
         verification_secret=MINT_SECRET,  # HS256 limitation; would be public key for RS256
@@ -51,25 +66,30 @@ def separated_setup():
         expected_audience=AUDIENCE,
         expected_rar_type=RAR_TYPE,
         client=client,
+        durable_state=rs_state,
     )
     dispatcher = Dispatcher(resource_server=rs)
-    return client, vault, rs, dispatcher, promised["task_id"], bystander["task_id"]
+    return (
+        client, authority, rs, dispatcher,
+        promised["task_id"], bystander["task_id"],
+        authority_state, rs_state,
+    )
 
 
-def _mint(vault, command, args, secret=USER_SECRET, binding_message="Delete task ?"):
+def _mint(authority, command, args, secret=USER_SECRET, binding_message="Delete task ?"):
     signed = sign_authorization_details(
         command=command, args=args, rar_type=RAR_TYPE,
         approver_id="alice", binding_message=binding_message, secret=secret,
     )
-    return vault.mint(signed)
+    return authority.mint(signed)
 
 
 # ── Happy path through all three layers ────────────────────────────────────
 
 
 def test_three_layer_happy_path(separated_setup):
-    client, vault, rs, dispatcher, promised, bystander = separated_setup
-    minted = _mint(vault, "delete-task", {"task_id": promised})
+    client, authority, rs, dispatcher, promised, bystander, _, _ = separated_setup
+    minted = _mint(authority, "delete-task", {"task_id": promised})
 
     outcome = dispatcher.execute("delete-task", {"task_id": promised}, approval_token=minted.credential)
 
@@ -79,48 +99,48 @@ def test_three_layer_happy_path(separated_setup):
     assert bystander in remaining
 
 
-# ── Layer 1: Vault refuses to mint when human signature is bad ─────────────
+# ── Layer 1: delegation authority refuses to mint when human signature is bad ─────────────
 
 
-def test_layer1_vault_refuses_bad_signature(separated_setup):
-    """Layer 1: Vault verify before mint."""
-    _, vault, _, _, promised, _ = separated_setup
-    from bridge.vault.interface import SignatureMismatch
+def test_layer1_authority_refuses_bad_signature(separated_setup):
+    """Layer 1: delegation authority verify before mint."""
+    _, authority, _, _, promised, _, _, _ = separated_setup
+    from actionauth.authority.interface import SignatureMismatch
     signed = sign_authorization_details(
         command="delete-task", args={"task_id": promised}, rar_type=RAR_TYPE,
         approver_id="alice", binding_message="Delete task t-42?",
         secret="WRONG-USER-SECRET-PADDED-32-bytes-fill",
     )
     with pytest.raises(SignatureMismatch):
-        vault.mint(signed)
+        authority.mint(signed)
 
 
-def test_vault_rejects_binding_message_swap(separated_setup):
+def test_authority_rejects_binding_message_swap(separated_setup):
     """Binding-message tampering: ``binding_message`` is in the canonical bytes.
 
     Threat: a compromised bridge renders one binding_message to the user
     ("Delete the temp file") but constructs a SignedAuthorizationDetails
     with a different binding_message ("Delete production DB") before
-    handing it to the Vault — same args, same command, the user thinks
+    handing it to the delegation authority — same args, same command, the user thinks
     they approved the cosmetic action.
 
     Defence: the HMAC the user computed is over the canonical bytes that
     include the message the user actually saw. If the bridge swaps the
-    binding_message, the canonical bytes the Vault recomputes differ
-    from the bytes the user signed, and the Vault refuses to mint with
+    binding_message, the canonical bytes the delegation authority recomputes differ
+    from the bytes the user signed, and the delegation authority refuses to mint with
     SignatureMismatch.
     """
-    from bridge.vault import SignedAuthorizationDetails
-    from bridge.vault.interface import SignatureMismatch
+    from actionauth.authority import SignedAuthorizationDetails
+    from actionauth.authority.interface import SignatureMismatch
 
-    _, vault, _, _, promised, _ = separated_setup
+    _, authority, _, _, promised, _, _, _ = separated_setup
     # User signs over message they actually saw.
     benign = sign_authorization_details(
         command="delete-task", args={"task_id": promised}, rar_type=RAR_TYPE,
         approver_id="alice", binding_message="Delete the temp file (low impact).",
         secret=USER_SECRET,
     )
-    # Compromised bridge tries to present a different binding_message to the Vault
+    # Compromised bridge tries to present a different binding_message to the delegation authority
     # while keeping everything else (including the user's signature) intact.
     tampered = SignedAuthorizationDetails(
         command=benign.command, args=benign.args, rar_type=benign.rar_type,
@@ -129,7 +149,7 @@ def test_vault_rejects_binding_message_swap(separated_setup):
         signature=benign.signature,
     )
     with pytest.raises(SignatureMismatch):
-        vault.mint(tampered)
+        authority.mint(tampered)
 
 
 # ── Layer 2: bridge cannot alter the minted claim ──────────────────────────
@@ -150,8 +170,8 @@ def test_layer3_rs_catches_credential_mutation_in_transit(separated_setup):
     Layer 3 catches what Layer 2's structural pass-through is supposed
     to make impossible in the first place.
     """
-    _, vault, _, dispatcher, promised, _ = separated_setup
-    minted = _mint(vault, "delete-task", {"task_id": promised})
+    _, authority, _, dispatcher, promised, _, _, _ = separated_setup
+    minted = _mint(authority, "delete-task", {"task_id": promised})
 
     header, body, sig = minted.credential.split(".")
     flipped_body_char = "A" if body[-1] != "A" else "B"
@@ -169,12 +189,12 @@ def test_layer3_rs_catches_credential_mutation_in_transit(separated_setup):
 def test_layer3_rs_rejects_drift_independently(separated_setup):
     """Layer 3: RS sees credential + live request; refuses on mismatch.
 
-    This is structurally distinct from Vault.consume rejecting drift,
-    because the RS has its own validation path. Even if the Vault is
+    This is structurally distinct from DelegationAuthority.consume rejecting drift,
+    because the RS has its own validation path. Even if the delegation authority is
     compromised into believing a credential is fine, the RS rejects.
     """
-    client, vault, _, dispatcher, promised, bystander = separated_setup
-    minted = _mint(vault, "delete-task", {"task_id": promised})
+    client, authority, _, dispatcher, promised, bystander, _, _ = separated_setup
+    minted = _mint(authority, "delete-task", {"task_id": promised})
 
     outcome = dispatcher.execute("delete-task", {"task_id": bystander}, approval_token=minted.credential)
 
@@ -184,19 +204,26 @@ def test_layer3_rs_rejects_drift_independently(separated_setup):
     assert {t["task_id"] for t in client.list()} == {promised, bystander}
 
 
-# ── Independence: Vault and RS keep separate consumed-jti state ─────────────
+# ── Independence: delegation authority and RS keep separate consumed-jti state ─────────────
 
 
-def test_independence_vault_and_rs_consumed_state_are_separate(separated_setup):
-    """The Vault's consumed set and the RS's consumed set are independent.
+def test_independence_authority_and_rs_consumed_state_are_separate(separated_setup):
+    """The delegation authority's consumed set and the RS's consumed set are independent.
 
     Here the credential is consumed at the RS by a successful execute().
-    A second attempt is rejected at the RS via its own _consumed set, not
-    via the Vault — the Vault never sees the credential at all when an
+    A second attempt is rejected at the RS via its own backend, not via
+    the delegation authority — the delegation authority never sees the credential at all when an
     RS is wired in.
+
+    The state rework dropped the components' private in-process
+    ``_consumed`` sets; single-use state now lives in each component's
+    injected :class:`DurableReplayState`. The fixture gives the delegation authority and
+    the RS *separate* backends, so we assert independence through the
+    backend API: the jti is consumed in the RS's table and absent from
+    the delegation authority's table.
     """
-    _, vault, rs, dispatcher, promised, _ = separated_setup
-    minted = _mint(vault, "delete-task", {"task_id": promised})
+    _, authority, rs, dispatcher, promised, _, authority_state, rs_state = separated_setup
+    minted = _mint(authority, "delete-task", {"task_id": promised})
 
     first = dispatcher.execute("delete-task", {"task_id": promised}, approval_token=minted.credential)
     assert isinstance(first, CommandSuccess)
@@ -205,10 +232,10 @@ def test_independence_vault_and_rs_consumed_state_are_separate(separated_setup):
     assert isinstance(replay, ApprovalRequired)
     assert replay.reason == "CredentialReplay"
 
-    # The Vault was never asked about this credential and has no record of consumption.
-    assert minted.jti not in vault._consumed
+    # The delegation authority was never asked about this credential and has no record of consumption.
+    assert not authority_state.is_jti_consumed(minted.jti)
     # The RS has the jti in its own state.
-    assert minted.jti in rs._consumed
+    assert rs_state.is_jti_consumed(minted.jti)
 
 
 # ── Layer 3 catches what Layer 1 + bridge tampering would miss ─────────────
@@ -217,21 +244,21 @@ def test_independence_vault_and_rs_consumed_state_are_separate(separated_setup):
 def test_rs_rejects_token_signed_with_different_mint_secret():
     """Sibling of test_rs_rejects_token_for_different_audience but at
     the secret-config level. Demonstrates that the Layer-3 RS verifies
-    against its OWN configured key, independent of the Vault's mint
+    against its OWN configured key, independent of the delegation authority's mint
     key. In the HS256 reference these are typically the same string;
     this test simulates a deployment where they're different (e.g., a
     misconfiguration, or a transitioning rotation) and proves the RS
     detects the mismatch."""
     client = InMemoryTaskStore()
     task = client.create(title="target")
-    vault = OAuthVault(
+    authority = OAuthAuthority(
         user_signing_secret=USER_SECRET,
         mint_secret=MINT_SECRET,
         issuer=ISSUER,
         audience=AUDIENCE,
         expected_rar_type=RAR_TYPE,
     )
-    # RS configured with a DIFFERENT verification secret than the Vault
+    # RS configured with a DIFFERENT verification secret than the delegation authority
     # mints under. In production RS256, this is the analogous
     # mismatch between holding the wrong public key.
     this_rs = JwtResourceServer(
@@ -243,7 +270,7 @@ def test_rs_rejects_token_signed_with_different_mint_secret():
     )
     dispatcher = Dispatcher(resource_server=this_rs)
 
-    minted = _mint(vault, "delete-task", {"task_id": task["task_id"]})
+    minted = _mint(authority, "delete-task", {"task_id": task["task_id"]})
     outcome = dispatcher.execute(
         "delete-task", {"task_id": task["task_id"]}, approval_token=minted.credential,
     )
@@ -254,10 +281,10 @@ def test_rs_rejects_token_signed_with_different_mint_secret():
 
 def test_rs_accepts_token_when_aud_is_array():
     """RFC 7519 permits ``aud`` to be a string OR an array of strings.
-    The reference's `OAuthVault` mints scalar `aud`; an external AS
+    The reference's `OAuthAuthority` mints scalar `aud`; an external AS
     (Keycloak, Authlete) commonly emits array. Verify the RS accepts
     both shapes — otherwise the documented "production swap doesn't
-    change Vault.consume" promise is broken."""
+    change DelegationAuthority.consume" promise is broken."""
     import base64
     import hashlib as _h
     import hmac as _hmac
@@ -265,7 +292,7 @@ def test_rs_accepts_token_when_aud_is_array():
     import secrets as _secrets
     import time as _time
 
-    from bridge.vault.oauth import _b64url, jwt_encode
+    from actionauth.authority.oauth import _b64url, jwt_encode
 
     client = InMemoryTaskStore()
     task = client.create(title="target")
@@ -293,7 +320,7 @@ def test_rs_accepts_token_when_aud_is_array():
     token = jwt_encode(claims, MINT_SECRET)
 
     outcome = rs.execute("delete-task", {"task_id": task["task_id"]}, token)
-    from bridge.rs import RsSuccess
+    from actionauth.rs import RsSuccess
     assert isinstance(outcome, RsSuccess)
 
 
@@ -301,11 +328,11 @@ def test_rs_rejects_token_for_different_audience():
     """If a JWT was minted for a different RS audience, this RS rejects.
 
     Demonstrates that the RS does its own audience check independent of
-    whatever the Vault enforces.
+    whatever the delegation authority enforces.
     """
     client = InMemoryTaskStore()
     task = client.create(title="target")
-    vault_for_other_rs = OAuthVault(
+    authority_for_other_rs = OAuthAuthority(
         user_signing_secret=USER_SECRET,
         mint_secret=MINT_SECRET,
         issuer=ISSUER,
@@ -315,13 +342,13 @@ def test_rs_rejects_token_for_different_audience():
     this_rs = JwtResourceServer(
         verification_secret=MINT_SECRET,
         expected_issuer=ISSUER,
-        expected_audience=AUDIENCE,  # different from what the vault minted for
+        expected_audience=AUDIENCE,  # different from what the authority minted for
         expected_rar_type=RAR_TYPE,
         client=client,
     )
     dispatcher = Dispatcher(resource_server=this_rs)
 
-    minted = _mint(vault_for_other_rs, "delete-task", {"task_id": task["task_id"]})
+    minted = _mint(authority_for_other_rs, "delete-task", {"task_id": task["task_id"]})
     outcome = dispatcher.execute(
         "delete-task", {"task_id": task["task_id"]}, approval_token=minted.credential,
     )

@@ -8,7 +8,7 @@ through pure-data transformations, no network.
 """
 import pytest
 
-from bridge.translation import (
+from actionauth.translation import (
     A2aAuthRequiredEvent,
     A2aResumeMessage,
     McpElicitationRequest,

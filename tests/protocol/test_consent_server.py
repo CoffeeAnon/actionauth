@@ -17,7 +17,7 @@ import pytest
 starlette = pytest.importorskip("starlette")
 from starlette.testclient import TestClient  # noqa: E402
 
-from bridge.consent.url_mode import ConsentStore, build_consent_app  # noqa: E402
+from actionauth.consent.url_mode import ConsentStore, build_consent_app  # noqa: E402
 
 
 USER_SECRET = "url-mode-test-user-secret-32bytes-pad"
@@ -88,7 +88,7 @@ def test_approve_then_bridge_polls_for_signed_payload(consent_setup):
     payload = result.json()
     assert payload["status"] == "approved"
     signed = payload["signed"]
-    # All fields the Vault needs are present.
+    # All fields the delegation authority needs are present.
     assert signed["command"] == "delete-task"
     assert signed["args"] == {"task_id": "task-42"}
     assert signed["rar_type"] == RAR_TYPE
@@ -236,7 +236,7 @@ def test_proposed_action_is_frozen():
     free-form payload"."""
     from dataclasses import FrozenInstanceError
 
-    from bridge.consent.url_mode import ProposedAction
+    from actionauth.consent.url_mode import ProposedAction
 
     action = ProposedAction.create(
         session_id="s",
@@ -270,7 +270,7 @@ def test_proposed_action_is_frozen():
 def test_proposed_action_snapshots_caller_args():
     """Mutating the caller's original args dict after ProposedAction
     creation must NOT affect the stored action; create() deep-copies."""
-    from bridge.consent.url_mode import ProposedAction
+    from actionauth.consent.url_mode import ProposedAction
 
     caller_args = {"task_id": "t-42", "nested": {"k": "v"}}
     action = ProposedAction.create(

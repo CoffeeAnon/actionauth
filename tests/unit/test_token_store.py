@@ -1,7 +1,7 @@
-"""Unit tests for bridge.auth.hmac — the shared TokenStore primitive."""
+"""Unit tests for actionauth.auth.hmac — the shared TokenStore primitive."""
 import pytest
 
-from bridge.auth.hmac import CallerIdentity, TokenStore, caller_from_token
+from actionauth.auth.hmac import CallerIdentity, TokenStore, caller_from_token
 
 
 SECRET = "test-secret"

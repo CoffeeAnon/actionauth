@@ -1,7 +1,7 @@
 """End-to-end composition test for the MCP HITL flow's *building blocks*.
 
 **Scope:** this test composes the translation dataclasses, the
-consent server, the Vault, and the RS *by hand* - it does not drive the
+consent server, the delegation authority, and the RS *by hand* - it does not drive the
 MCP server's ``tools/call`` wire. That wire IS now bundled: the
 single-agent emission + resume path through the real MCP server is
 exercised by ``tests/e2e/test_mcp_elicitation_emission.py`` (and the
@@ -16,7 +16,7 @@ What this test proves:
     response → A2A resume.
   - The consent server's three endpoints (render, submit, result)
     correctly intermediate the human-in-the-loop step.
-  - The Vault's mint + the RS's consume operate on the building
+  - The delegation authority's mint + the RS's consume operate on the building
     blocks' outputs without further glue.
 
 What this test does NOT prove:
@@ -35,24 +35,24 @@ import pytest
 starlette = pytest.importorskip("starlette")
 from starlette.testclient import TestClient  # noqa: E402
 
-from bridge.consent.url_mode import ConsentStore, build_consent_app  # noqa: E402
-from bridge.core.client import InMemoryTaskStore  # noqa: E402
-from bridge.rs import JwtResourceServer, RsSuccess  # noqa: E402
-from bridge.translation import (  # noqa: E402
+from actionauth.consent.url_mode import ConsentStore, build_consent_app  # noqa: E402
+from actionauth.core.client import InMemoryTaskStore  # noqa: E402
+from actionauth.rs import JwtResourceServer, RsSuccess  # noqa: E402
+from actionauth.translation import (  # noqa: E402
     A2aAuthRequiredEvent,
     McpElicitationResponse,
     a2a_auth_required_to_mcp_elicitation,
     mcp_elicitation_response_to_a2a_resume,
 )
-from bridge.vault import (  # noqa: E402
-    OAuthVault,
+from actionauth.authority import (  # noqa: E402
+    OAuthAuthority,
     SignedAuthorizationDetails,
 )
 
 
 USER_SECRET = "mcp-roundtrip-user-secret-32bytes-pad"
 MINT_SECRET = "mcp-roundtrip-mint-secret-32bytes-padxx"
-ISSUER = "https://vault.reference.invalid"
+ISSUER = "https://authority.reference.invalid"
 AUDIENCE = "bridge-resource-server"
 RAR_TYPE = "tasktracker_task_action"
 BRIDGE_BASE_URL = "https://bridge.example"
@@ -60,12 +60,12 @@ BRIDGE_BASE_URL = "https://bridge.example"
 
 @pytest.fixture
 def world():
-    """Full Tier-2 setup: store + Vault + RS + consent server + TestClient."""
+    """Full Tier-2 setup: store + delegation authority + RS + consent server + TestClient."""
     store = InMemoryTaskStore()
     target = store.create(title="Q2 launch checklist")
     bystander = store.create(title="Q3 onboarding doc")
 
-    vault = OAuthVault(
+    authority = OAuthAuthority(
         user_signing_secret=USER_SECRET,
         mint_secret=MINT_SECRET,
         issuer=ISSUER,
@@ -85,13 +85,13 @@ def world():
     )
     return {
         "store": store, "target": target, "bystander": bystander,
-        "vault": vault, "rs": rs,
+        "authority": authority, "rs": rs,
         "consent_store": consent_store, "consent_client": consent_client,
     }
 
 
 def test_mcp_hitl_building_blocks_happy_path(world):
-    """The translation + consent + Vault + RS building blocks compose
+    """The translation + consent + delegation authority + RS building blocks compose
     correctly. NOT a proof that the MCP server emits the elicitation
     in production - that's the unbundled next step."""
     target = world["target"]
@@ -154,7 +154,7 @@ def test_mcp_hitl_building_blocks_happy_path(world):
     assert a2a_resume.approved
     assert a2a_resume.context_id == a2a_event.context_id  # round-trip continuity
 
-    # 8. Bridge presents the signed RAR to the Vault → mint credential.
+    # 8. Bridge presents the signed RAR to the delegation authority → mint credential.
     signed = SignedAuthorizationDetails(
         command=signed_dict["command"],
         args=signed_dict["args"],
@@ -164,7 +164,7 @@ def test_mcp_hitl_building_blocks_happy_path(world):
         binding_message=signed_dict["binding_message"],
         signature=signed_dict["signature"],
     )
-    minted = world["vault"].mint(signed)
+    minted = world["authority"].mint(signed)
 
     # 9. Bridge forwards the credential to the RS → validate + execute.
     outcome = world["rs"].execute(

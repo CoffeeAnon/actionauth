@@ -1,6 +1,8 @@
 # Architecture
 
-Companion to `rationale.md`. The rationale answers *why*; this document answers *how*: components, flows, and the threat model. The security core is the Vault delegation pattern (sign exact `(command, args)` → mint single-use credential → resource server enforces); the two HITL walkthroughs below show it carried over the single-domain path (a single MCP agent, implemented in code) and the multi-domain path (A2A between agents, target architecture). A2A carries the signed approval; it is not where the security comes from.
+Companion to `docs/rationale.md`. The rationale explains why the system is designed this way; this document details how components interact, describes message flows, and analyzes the threat model.
+
+The core security model relies on parameter-bound token delegation: a human signs the exact `(command, args)` payload, the delegation authority mints a single-use credential, and the resource server enforces those parameters upon execution. The two walkthroughs below illustrate this pattern across both single-agent MCP flows and multi-agent A2A flows.
 
 ## Components
 
@@ -14,7 +16,7 @@ Companion to `rationale.md`. The rationale answers *why*; this document answers 
                                       │ (RAR consent screen)
                                       ▼
                        ┌──────────────────────────────────┐
-   ┌──── signed ──────▶│   Vault / Delegation Engine     │
+   ┌──── signed ──────▶│   authority / Delegation Engine  │
    │   RAR payload     │   (OAuth AS, HashiCorp Vault,    │
    │  (HMAC over       │    Entra, IBM Verify, …)         │
    │   authorization_  │                                  │
@@ -30,67 +32,71 @@ Companion to `rationale.md`. The rationale answers *why*; this document answers 
    │   │                  Agent service (this reference)             │
    │   │                                                             │
    │   │   ┌────────────────────────┐    ┌────────────────────────┐  │
-   │   │   │  A2A surface           │    │  MCP surface           │  │
+   │   │   │  A2A interface         │    │  MCP interface         │  │
    │   │   │  (production wiring;   │    │  (`/mcp`)              │  │
-   │   │   │   simulated by         │    │  - tools/list           │  │
-   │   │   │   bridge.walkthrough)  │    │  - tools/call           │  │
+   │   │   │   simulated by         │    │  - tools/list          │  │
+   │   │   │  walkthrough.py)       │    │  - tools/call          │  │
    │   │   └────────────┬───────────┘    └────────────┬───────────┘  │
-   │   │                │                              │              │
-   │   │                └───────────┬──────────────────┘              │
-   │   │                            ▼                                 │
-   │   │              ┌──────────────────────────────┐                │
-   │   │              │  Tool dispatch + HITL gate   │                │
-   │   │              │  (bridge.core.dispatcher)    │                │
-   │   │              │  - resolves tool by name     │                │
-   │   │              │  - if requires_approval:     │                │
-   │   │              │      route to RS (Tier 2)    │                │
-   │   │              │      or Vault (Tier 1)       │                │
-   │   │              └──────────────────────────────┘                │
-   │   │                            │                                 │
-   │   └────────────────────────────┼─────────────────────────────────┘
+   │   │                │                             │              │
+   │   │                └───────────┬─────────────────┘              │
+   │   │                            ▼                                │
+   │   │              ┌──────────────────────────────┐               │
+   │   │              │  Tool dispatch + HITL gate   │               │
+   │   │              │ (actionauth.core.dispatcher) │               │
+   │   │              │  - resolves tool by name     │               │
+   │   │              │  - if requires_approval:     │               │
+   │   │              │      route to RS (Tier 2)    │               │
+   │   │              │      or authority (Tier 1)   │               │
+   │   │              └──────────────────────────────┘               │
+   │   │                            │                                │
+   │   └────────────────────────────┼────────────────────────────────┘
    │                                ▼
    │              ┌──────────────────────────────┐
-   │              │  Resource server              │
-   │              │  (bridge.rs.JwtResourceServer)│
-   │              │                               │
-   │              │  - validates Bearer token     │
-   │              │  - verifies                   │
-   │              │    authorization_details      │
-   │              │    matches request            │
-   │              │  - executes (or rejects on    │
-   │              │    drift / replay)            │
+   │              │  Resource server             │
+   │              │  (actionauth.rs.             │
+   │              │   JwtResourceServer)         │
+   │              │  - validates Bearer token    │
+   │              │  - verifies                  │
+   │              │    authorization_details     │
+   │              │    matches request           │
+   │              │  - executes (or rejects on   │
+   │              │    drift / replay)           │
    └──────────────┴──────────────────────────────┘
 ```
 
-## The Vault contract
+## Delegation authority contract
 
-Both `InProcessVault` (Tier 1) and `OAuthVault` (Tier 2) satisfy a single `Vault` Protocol:
+Both `InProcessAuthority` (Tier 1) and `OAuthAuthority` (Tier 2) implement a shared `DelegationAuthority` protocol:
 
-- **`mint(signed_authorization_details) → MintedCredential`**: verify the human signature, then mint a single-use, action-scoped credential bound to the approved arguments. Both implementations bound the signer's requested `exp` against a `max_signed_payload_ttl_seconds` policy (default 600s); an over-long signed payload is rejected as `PayloadDriftAtMint` rather than minted.
-- **`consume(credential, command, args) → MintedCredential`**: validate the credential against the live request at execution time. Mark consumed. Reject replays, drift, expiry, and signature mismatches with typed exceptions.
+- **`mint(signed_authorization_details) -> MintedCredential`**: Verifies the human signature, then mints a single-use credential bound to the approved arguments. Both implementations enforce a maximum TTL via `max_signed_payload_ttl_seconds` (default 600s); requests with expiration timestamps beyond this window are rejected as `PayloadDriftAtMint`.
+- **`consume(credential, command, args) -> MintedCredential`**: Validates the credential against the live request at execution time and marks the token consumed. Replays, argument drift, expiration, and invalid signatures raise typed exceptions.
 
-**Structural binding at the bridge.** Between elicitation emission and signing, the bridge holds the proposed action in a `ProposedAction` dataclass (`bridge.consent.url_mode`) that is `frozen=True` with `args` wrapped in `types.MappingProxyType` over a deep-copy. Re-assignment is blocked by the frozen dataclass, and in-place mutation is blocked by the read-only mapping. The "credential is bound to the parameters the human approved" property reduces to this immutability plus the canonical-bytes contract: there is no point in time between emission and signing at which the bridge can alter what the human is being asked to sign.
+### Structural parameter immutability
 
-The dispatcher calls `consume` (or, in the Tier-2 separated-RS shape, forwards the credential to the RS, which performs the equivalent validation independently). The bridge layer calls `mint` in response to an elicitation approval.
+Between emitting an elicitation and receiving a signature, the bridge preserves proposed actions in an immutable dataclass (`ProposedAction` in `actionauth.consent.url_mode`, configured with `frozen=True` and `types.MappingProxyType` over copied arguments). This prevents in-place mutation or reassignment, ensuring the parameters signed by the user cannot change before submission to the delegation authority.
+
+The dispatcher calls `consume` directly (or forwards the token to the resource server for independent verification in Tier 2).
 
 ## Three independent enforcement layers (Tier 2)
 
-The central architectural claim, three independent enforcement layers, is exercised through real code paths by `tests/e2e/test_three_layer_enforcement.py`:
+Tier 2 distributes validation across three isolated layers (verified by `tests/e2e/test_three_layer_enforcement.py`):
 
-1. **Vault verifies the human signature** *before* minting (`OAuthVault.mint`). Raises `SignatureMismatch` on bad signature, `CredentialExpired` if the signed payload is already past its `exp`, and `PayloadDriftAtMint` if `exp` exceeds the Vault's `max_signed_payload_ttl_seconds`.
-2. **Bridge forwards the minted credential unmodified** to the RS (`Dispatcher._execute_via_rs` is a 4-line pass-through). Layer 2 is structural: a property of the dispatcher's pass-through implementation, asserted by code inspection rather than by a dynamic test. Layer 3 catches any deviation if it occurs.
-3. **Resource server validates independently** (`JwtResourceServer.execute`): own verification key, own `iss`/`aud`/`exp` checks, own consumed-jti state, own `authorization_details`-vs-live-request binding check.
+1. **Delegation authority verifies user signatures before minting** (`OAuthAuthority.mint`). It rejects invalid signatures with `SignatureMismatch`, expired payloads with `CredentialExpired`, and excessive TTLs with `PayloadDriftAtMint`.
+2. **Bridge passes credentials without modification** to the resource server (`Dispatcher._execute_via_rs`). The dispatcher implementation is intentionally a minimal pass-through.
+3. **Resource server validates tokens independently** (`JwtResourceServer.execute`). It uses its own verification keys, validates `iss`, `aud`, and `exp` claims, maintains its own consumed token state, and confirms that `authorization_details` match the active command arguments.
 
-The bridge is in the data path of all three layers but in the trust path of none of them.
+The bridge relays requests between layers without verifying tokens itself.
 
-**Layer asymmetry.** Layers 2 and 3 are mutually independent - a bug in either does not compromise the other. **Layer 1 is the trust root for the human-signature property**: the RS has no access to the human's HMAC (it's not embedded in the minted JWT's claims), so an `OAuthVault` bug that mints without verifying the human signature is *not* caught downstream. The threat-model row "Vault compromise - out of scope" acknowledges this trust-root status. Layers 2 and 3 protect *what happens after mint*; Layer 1 protects *whether mint should have happened at all*.
+### Layer trust boundaries
 
-## HITL flow walkthroughs
+Layers 2 and 3 operate independently: a failure in one does not compromise the other. However, Layer 1 is the single trust root for user signature verification. Because the resource server validates the minted JWT rather than the human HMAC signature directly, a bug in the delegation authority that mints without verifying the signature will go unnoticed downstream. Layers 2 and 3 protect execution after token creation; Layer 1 determines whether token creation should occur.
 
-### `delete_task` invoked through the A2A surface (target architecture)
+## Walkthroughs
+
+### 1. `delete_task` via A2A (multi-agent target architecture)
 
 ```
-Client                       Agent service                 Vault                 RS
+Client                       Agent service                 authority                 RS
   │                                  │                       │                    │
   │── POST /a2a (delete) ───────────▶│                       │                    │
   │                                  │ validate t-base       │                    │
@@ -123,12 +129,12 @@ Client                       Agent service                 Vault                
   │◀── SSE: completed                │                       │                    │
 ```
 
-### `delete_task` invoked through the MCP surface (single-domain, implemented)
+### 2. `delete_task` via MCP (single-agent reference implementation)
 
-This is the single-domain path, and it is the one the reference implements in code: a single MCP agent emits the URL-mode elicitation and resumes on retry, with no A2A. The flow is driven end to end through the actual server in `tests/e2e/test_mcp_elicitation_emission.py`. The A2A walkthrough above is the multi-domain carrier, and is target architecture (simulated by `bridge.walkthrough`).
+This flow runs directly in the reference codebase. An MCP agent emits a URL elicitation for approval and resumes execution on retry without A2A (`tests/e2e/test_mcp_elicitation_emission.py`).
 
 ```
-MCP host (LLM)              Agent service                    Vault                RS
+MCP host (LLM)              Agent service                    authority                RS
   │                               │                            │                   │
   │── tools/call delete_task ────▶│                            │                   │
   │                               │ dispatch sees              │                   │
@@ -137,7 +143,7 @@ MCP host (LLM)              Agent service                    Vault              
   │                               │   details                  │                   │
   │◀── elicitation/create        │                            │                   │
   │    {mode:"url",               │                            │                   │
-  │     url: bridge/consent/…}    │                            │                   │
+  │     url: actionauth/consent/…}│                            │                   │
   │                               │                            │                   │
   │ (human visits URL, reviews    │                            │                   │
   │  action, signs)               │                            │                   │
@@ -152,61 +158,53 @@ MCP host (LLM)              Agent service                    Vault              
   │◀── tools/call result         │                            │                   │
 ```
 
-The trust dance is identical across both surfaces - only the protocol envelope differs.
+Both MCP and A2A follow the same verification steps; only the transport message format differs.
 
 ## State and persistence
 
-### `context_id` continuity
+### Context continuity
 
-The agent service keys conversation state by `context_id`. A new MCP `tools/call` carrying a `context_id` (via the `elicitation_id`-derived round-trip in `bridge.translation`) resumes the same conversation. A call without a `context_id` opens a new one.
-
-In the reference, the consent server's session-id is the carrier: `elicitation_id = "el:<context_id>:<task_id>"`. The bridge recovers `context_id` from the elicitation response in `bridge.translation.mcp_elicitation_response_to_a2a_resume`.
+The agent service tracks conversations by `context_id`. In MCP flows, the session identifier in `elicitation_id` maps back to the active conversation (`elicitation_id = "el:<context_id>:<task_id>:<b64url(tag)>"`). An HMAC tag over `(context_id, task_id)` keyed with the bridge's process-local secret prevents forging valid IDs. The bridge verifies this tag and recovers `context_id` when handling elicitation responses in `actionauth.translation.mcp_elicitation_response_to_a2a_resume`.
 
 ### Token lifecycle
 
-- **Base token**: long-lived per-session token issued at agent-client setup time, carrying minimum scope (e.g., `tasks.read`). Validated on every request.
-- **Per-action minted credential**: single-use, short-lived (5 min default), parameter-bound. Acquired through the Vault mint flow at the moment of approval. Validated on the dispatch / RS call.
+- **Base token**: Long-lived per-session token issued at client setup, carrying read scope (`tasks.read`). Validated on every incoming request.
+- **Action-scoped token**: Single-use, short-lived credential (default 5 minutes), bound to specific tool arguments. Minted upon human approval and validated during tool execution.
 
-Restart caveat: the consumed-jti set in `OAuthVault` and `JwtResourceServer` is process-local. A bridge or RS restart inside the JWT TTL discards the record. Production deployments must back this with a durable TTL-aware store (sqlite, Redis). Tier 1 is structurally closed against this because `_issued` is also process-local - post-restart credentials fail at `SignatureMismatch`, not as replays.
+**Restart behavior:** The default in-memory state backend tracks consumed tokens in memory. If the process restarts within a token's lifetime, records are lost. Production deployments should configure persistent storage using `DurableReplayState` (backed by SQLite) or implement an external backend such as Redis or Postgres behind the `StateBackend` interface.
 
-### Audit attribution
+### Audit logging
 
-Every dispatch event writes an audit row (`bridge.audit.AuditSink`). The bundled CLI emits `tool_call` rows. Richer kinds (`approval_granted`, `approval_rejected`, `error`) are schema-supported but not exercised by the reference.
+Every dispatch event writes a record to `AuditSink` in SQLite. The demo emits `tool_call` entries; the schema also supports `approval_granted`, `approval_rejected`, and `error` event types.
 
 ## Failure modes
 
-| Mode | Behaviour |
-|---|---|
-| HITL approval denied | Bridge polls consent → "denied" → resume with `approved=False` → dispatcher returns `ApprovalRequired` with `reason="decline"`. |
-| HITL approval timeout | Consent session expires; bridge sees no signed payload; resume with `approved=False`. |
-| Parameter mismatch at consume | `CredentialDrift` exception → `ApprovalRequired(reason="CredentialDrift")` from the dispatcher. The RS never executes the drifted action. |
-| Server restart during pause | Pending HITL gates are not persisted; an attempted resume returns `SignatureMismatch` (Tier 1) or fails at the RS's empty consumed set (Tier 2). |
-| Token re-use | Per-action credentials are single-use; second consume attempt → `CredentialReplay`. **Caveat:** within the signed-payload TTL, a captured signed payload can produce *multiple* distinct credentials for the *same* `(command, args)`. Reference enforces "fresh consent per action shape", not "fresh consent per execution"; the RS must add per-action idempotency for actions where double-execution is consequential. |
+| Mode | Behavior |
+| --- | --- |
+| Approval denied | User denies consent; resume runs with `approved=False`; dispatcher returns `ApprovalRequired(reason="decline")`. |
+| Approval timeout | Consent session expires before approval; resume runs with `approved=False`. |
+| Parameter mismatch | Arguments differ from the approved payload; dispatcher returns `ApprovalRequired(reason="CredentialDrift")`. |
+| Process restart during pause | In-memory pending gates are cleared; resume requests fail signature verification (Tier 1) or replay checks (Tier 2). |
+| Token replay | Re-executing a consumed token raises `CredentialReplay`. Presenting the same signed payload twice raises `SignatureReplay` at mint. |
 
 ## Threat model
 
 | Threat | Mitigation |
-|---|---|
-| **Prompt-injected agent** attempts destructive action. | The agent holds no `tasks.delete` credential. A delete attempt produces an `auth_required` event that the human must approve via their MCP host. The injected instruction cannot bypass the human-consent step because the consent step is what *creates* the credential. |
-| **Compromised agent process.** | In production-shape: agent holds only the read-scoped `t-base`. Per-action tokens exist only between Vault mint and RS consumption. **In the reference's HS256 demo**, both `user_signing_secret` and `mint_secret` are co-located in the agent process for self-containedness; an attacker has both, and only the "fresh-consent-per-action-shape" property remains as a barrier. Production Tier-2 must move signing client-side (WebAuthn/Passkey). |
-| **Parameter drift after approval.** | Three independent layers reject (`tests/e2e/test_three_layer_enforcement.py`): (1) bridge signs over the *emitted* `authorization_details`, held in a frozen `ProposedAction` with `MappingProxyType` args (structural; re-assignment and in-place mutation both blocked between emission and signing); (2) Vault refuses to mint if the HMAC doesn't verify; (3) RS validates the minted token's `authorization_details` against the live request. |
-| **Token replay across actions.** | Single-use at the RS via consumed-jti tracking. The token is also pinned to specific `authorization_details`, so capturing it gives no leverage outside the original action. **Carve-out:** single-use is enforced at *consume* (per-jti), not at *mint* (per-signed-payload). A captured signed payload can mint multiple credentials for the *same* `(command, args)` until the signed-payload TTL expires. Reference enforces "fresh consent per action shape", not "fresh consent per execution"; for actions where double-execution matters, the RS must add per-action idempotency or the Vault must track consumed signed-payload signatures at mint time. See "Failure modes" item "Token re-use" for the operational discussion. |
-| **Bridge compromise.** | In production-shape: the bridge cannot mint tokens unilaterally - minting requires a verified human signature, and the user signing key is held by the human's MCP host. Bridge compromise allows re-mint within TTL for previously-approved actions but cannot fabricate signatures for *new* actions. **In the reference's demo configuration**, the bridge holds the user signing key via `bridge.consent.demo_signer`; a bridge compromise is equivalent to a human-key compromise. The demo signer module is the seam to replace. |
-| **Vault compromise.** | Out of scope - the Vault is the trust root. Standard Vault-hardening practices apply. |
-| **Human-side key compromise.** | Reduces to "attacker is the human." Mitigations are out-of-band: WebAuthn-bound keys (TPM / Secure Enclave), short-lived user-side signing keys. |
-| **Denied-action retry without re-approval.** | Retry produces a fresh `auth_required` event. No cached approvals. |
+| --- | --- |
+| **Prompt-injected agent** attempts destructive action. | The agent holds only read permissions. Destructive commands trigger an approval event that requires user confirmation; the LLM cannot fabricate the necessary signature. |
+| **Compromised agent process.** | In production, agents hold only base read credentials. Action tokens exist briefly between minting and consumption. Moving user signing client-side (WebAuthn) prevents a compromised agent from generating valid signatures. |
+| **Parameter drift after approval.** | Three independent checks prevent drift: (1) proposed actions are stored in frozen dataclasses, (2) the delegation authority verifies the HMAC over canonical arguments before minting, and (3) the resource server matches token claims against incoming parameters. |
+| **Token replay across requests.** | Resource servers track consumed `jti` identifiers. Delegation authorities track signature hashes at mint time (`SignatureReplay`), preventing repeated minting from one approval. |
+| **Bridge compromise.** | In production, the bridge cannot mint tokens unilaterally because signing keys remain on the user device. |
+| **Delegation authority compromise.** | Out of scope; the delegation authority is the trust root. Standard key protection and access controls apply. |
+| **User signing key compromise.** | Out of scope; equivalent to a compromised user account. Mitigated by hardware-backed keys (WebAuthn / Secure Enclave). |
+| **Denied action retried without approval.** | Retrying a denied command generates a new approval request; prior denials are never cached as approvals. |
+| **Untrusted MCP host.** | The `elicitation_id` is an HMAC-tagged carrier (`el:<context_id>:<task_id>:<tag>`), so a host without the tag secret cannot fabricate IDs that the bridge will accept. A multi-replica or shared-host deployment where the tag secret cannot be confined must replace the carrier with a signed token. See `actionauth.translation.a2a_mcp`. |
 
-## What the reference deliberately leaves out
+## Intentional demo omissions
 
-- **Real OAuth authorization server**: `OAuthVault` is an HS256 in-process stand-in for the architectural shape. Production deploys swap in Keycloak/Authlete/Auth0/Curity etc.
-- **Durable consumed-jti storage**: in-memory `set()` in the reference; production must use sqlite/Redis.
-- **Client-side signing key custodian**: the bundled `bridge.consent.demo_signer` runs server-side. Production must use WebAuthn / Passkey on the human's MCP host.
-- **A2A executor wiring**: the A2A surface is described and simulated by `bridge.walkthrough`, not bundled as live code. Production A2A integrations write their own executor over the same Vault/dispatcher core.
-- **MCP elicitation emission** *(now bundled)*: the MCP server emits a URL-mode elicitation (`URL_ELICITATION_REQUIRED`) on a HITL-gated `tools/call` and resumes on retry (`bridge/mcp/server.py` + `bridge/mcp/hitl.py`), the single-agent secure-approval path, no A2A. Gated tools surface only via an explicit `MCP_HITL_ALLOWLIST` and only when a HITL gate (consent store + Vault) is wired; otherwise the surface stays read-only. Exercised by `tests/e2e/test_mcp_elicitation_emission.py`; `tests/e2e/test_mcp_hitl_building_blocks.py` remains as the by-hand composition.
-- **Multi-tenant federation**: single AS / single RS / single bridge. Federated deployments are a deployment concern.
-- **DPoP** (RFC 9449) for sender-constrained tokens: strongly recommended for production. Mitigates token theft over the wire; not modelled in the threat-model table.
-- **Untrusted MCP host**: the bridge trusts the MCP host to route elicitation responses faithfully. The `elicitation_id` is a process-local HMAC-tagged carrier (`el:<context_id>:<task_id>:<tag>`), so a host that does not hold the tag secret cannot fabricate IDs; but a cooperating-but-replica host might still need a different carrier. The reference is designed for cooperative MCP hosts the human controls (Claude Desktop, IDE, custom orchestrator); a multi-replica or shared-host deployment that needs cross-host routing safety must share the tag secret or replace the elicitation-ID shape with a signed token. See the docstring in `bridge.translation.a2a_mcp` for the rationale.
-
-## Canonical-form contract
-
-Cross-language signers (for example, a JavaScript MCP host) must produce byte-identical canonical bytes for HMAC verification to succeed. The contract is in `bridge/vault/CANONICAL.md`. Test fixtures lock the byte-level output for known inputs, including a non-ASCII case (`ï` → `ï`); `ensure_ascii=True` is what makes the encoding stable across signers.
+- **OAuth authorization server**: `OAuthAuthority` is an in-process HS256 mock. Production setups should use standard OAuth authorization servers (such as Keycloak, Auth0, or Hydra).
+- **Asymmetric cryptographic keys**: The demo uses symmetric HMAC secrets between delegation authority and resource server. Production requires RS256/ES256 with JWKS endpoints.
+- **Client-side signing**: `actionauth.consent.demo_signer` simulates client signatures on the server. Production should use WebAuthn or Passkeys directly on the user device.
+- **Federation**: The reference runs a single delegation authority, single resource server, and single bridge instance.
+- **DPoP tokens**: Tokens are bearer-based rather than sender-constrained with RFC 9449.

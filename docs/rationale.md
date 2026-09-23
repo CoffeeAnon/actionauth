@@ -1,114 +1,75 @@
-# Design Rationale
+# Design rationale
 
-This document captures the *why* behind the design. The companion `architecture.md` covers the *how*.
+This document explains the reasoning behind the architecture. For component details, sequence diagrams, and failure modes, see `docs/architecture.md`.
 
 ## Four necessary and sufficient constraints
 
-A bridge that lets an LLM call destructive tools through a human-in-the-loop (HITL) check has to hold four properties at once. Each is independent of the others and each fails in a specific way if missing. Together they are sufficient for the design's goal: *every change to data is approved by a named human, and the approval is verifiable from an audit log alone.*
+Allowing an LLM to invoke sensitive tools with human-in-the-loop (HITL) approval requires four properties. Each addresses a specific failure mode:
 
-1. **Parameter-Bound Intent.** The human's signature is computed over the canonical bytes of the exact command and arguments that will run. Without this, the LLM can swap arguments after approval (the "drift attack") and the system has no way to notice.
-2. **Consent Atomicity.** One signed payload mints at most one credential. Without this, a captured signed payload (leaked WebSocket frame, compromised relay, hostile bridge holding the bytes) can be replayed to mint N credentials for the same action within the signed-payload TTL - one approval, N executions.
-3. **Independent Consent Surface.** The entity that displays the proposed action to the human is in a different trust domain from the entity orchestrating the LLM. Without this, a hostile bridge can render one action on screen while passing canonical bytes for a different action to the user's signer, and the binding-message defence only catches the deception forensically after the fact.
-4. **Destination Gating.** The resource server refuses any request lacking a valid Vault-minted, parameter-bound credential. Without this, an agent that finds the RS's direct API can bypass the entire architecture by calling it without a credential at all.
+1. **Parameter-bound intent.** The human signature covers the exact command and arguments. Without this, an LLM could substitute parameters after receiving approval.
+2. **Consent atomicity.** One signed payload mints at most one credential. Without this, a captured payload could be replayed to execute an action multiple times within the signature lifetime.
+3. **Independent consent surface.** The service displaying proposed actions to the user sits in a separate trust domain from the agent orchestrating the LLM. Without this separation, a compromised bridge could render one action on screen while submitting different parameters for signing.
+4. **Destination gating.** The resource server rejects any request lacking a valid, parameter-bound credential. Without this check, an agent could bypass approval by calling the resource server directly.
 
-The reference closes constraints 1, 2, and 4 in code. Constraint 3 is a deployment-shape requirement (the demo's consent server runs on the bridge for self-containedness; see "Production deployment shape" below).
+The reference code enforces constraints 1, 2, and 4. Constraint 3 requires a consent surface in a separate trust domain from the bridge in production; the bundled demo runs the consent UI in-process for simplicity.
 
-## The security core and the two paths
+## Cryptographic delegation model
 
-The four constraints come from one core: a human signs the exact `(command, args)`, an authorization server (Vault) mints a single-use credential bound to those bytes, and the resource server refuses anything else. The security comes from that core, not from A2A. A2A is one way to carry a signed approval between processes, and the guarantee that the approval means what it says comes from the Vault binding, not from the transport.
+Security rests on parameter-bound token delegation rather than transport protocols:
 
-What varies between deployments is not how many agents are involved, but whether the signed approval stays inside one agent's own domain or has to cross into another's. The reference answers two questions on that axis.
+1. The user signs the exact `(command, args)` payload.
+2. The delegation authority verifies the signature and mints a single-use credential containing those arguments (`authorization_details`).
+3. The resource server checks the credential against the live request and rejects mismatched arguments or reused tokens.
 
-**Single-domain.** A user approves an action in a zero-trust way, through an interface the agent can watch but not subvert. One agent exposing MCP tools answers this, with no A2A: the server emits a URL-mode elicitation on a HITL-gated `tools/call` and resumes on retry once the human has approved (`bridge/mcp/hitl.py`). The signed approval is produced and consumed inside that one agent's transaction. It still spans several trust surfaces (the human's MCP host, the agent, and the consent server in a separate trust domain), which is what "watch but not subvert" requires: constraint 3 plus a faithful host, since the agent picks the URL and relays the response.
+### Single-domain vs multi-domain paths
 
-**Multi-domain.** A sub-agent developer needs to trust that the human really authorized this specific change. The signed approval has to cross into a separate agent's domain, with the leaf action bound by the Vault. It needs a carrier that pauses a deep action and bubbles its `authorization_details` back to the human's signer with no bearer-passing. A2A's task lifecycle is built for exactly that cross-agent pause and resume, which is why the reference uses it. The security still does not come from A2A: the Vault binds the human's signature to the action, so the property would hold over any carrier of A2A's shape. The substitution is a different cross-agent transport, not a different security model, and not MCP, which is host-to-tool rather than agent-to-agent. (OAuth token exchange, RFC 8693, is complementary: it propagates delegated authority across principals but does not itself carry the interactive approval pause. See "Out of scope for v1".)
+What varies between deployments is not the agent count but whether the signed approval stays within one domain or crosses into another's:
 
-Two protocol-level properties hold across both paths:
+- **Single-domain (MCP):** A single MCP server emits a URL elicitation for gated tools and resumes execution once approved (`actionauth/mcp/hitl.py`). The entire approval flow stays within that agent's domain.
+- **Multi-domain (A2A):** When an action originates in a sub-agent, the approval request must bubble up to the user's primary interface. A2A tasks provide pause and resume semantics across domain boundaries, preserving context continuity while routing the signed payload back to the originating agent.
 
-1. **Stateful.** `context_id` continuity across calls.
-2. **HITL-aware.** A pause translated to an MCP elicitation (and, on the multi-domain path, an A2A `auth_required` SSE event translated likewise), with the resume routing back to the paused action.
+## Enforcement layers in Tier 2
 
-The rest of this section covers the core that both paths share, then the carrier the reference ships for the multi-domain path.
+Tier 2 implements three independent validation layers:
 
-### The core: cryptographic delegation
+1. **Delegation authority signature verification:** The delegation authority verifies the HMAC over canonical authorization bytes and records the signature hash to prevent double-minting (`SignatureReplay`).
+2. **Bridge pass-through:** The bridge forwards minted credentials to the resource server without modification.
+3. **Resource server verification:** The resource server validates JWT signatures, expiration, and argument bindings independently of the delegation authority, tracking consumed token identifiers (`jti`).
 
-`bridge.vault` and `bridge.rs` realise constraints 1, 2, and 4 across three independent enforcement layers:
+This design follows the Rich Authorization Requests (RAR) model from RFC 9396.
 
-1. **Vault verifies the human signature and tracks signed-payload single-use.** Constraint 1 (parameter binding) and constraint 2 (consent atomicity) both close here. The Vault verifies the HMAC over canonical authorization-details bytes and refuses to mint twice from the same signed payload (`_consumed_signatures`). One signature exchanges for one credential.
-2. **Bridge cannot alter** what the Vault minted: a JWT pinned to the approved parameters. (Structural property of the dispatcher's pass-through, asserted by code inspection.)
-3. **Resource server validates** the credential's `authorization_details` claim against the live request, with its own consumed-jti state. Constraint 4 (destination gating).
+## Production consent UI requirements
 
-The bridge sits in the data path of every authorization decision but in the trust path of none of them. This is the Rich Authorization Requests (RAR) pattern (RFC 9396 per-action `authorization_details` + per-action mint + RS enforcement) adapted from open-banking FAPI 2.0 deployments to agent authorization. FAPI 2.0 layers further mechanisms on top (mTLS, DPoP, PAR) that this reference does not implement - the *core* RAR-binding pattern is what it draws on.
+In the local demo, `actionauth/consent/url_mode.py` runs inside the bridge process. The demo prevents argument tampering using immutable data structures (`ProposedAction` with `frozen=True` and `MappingProxyType`).
 
-**Layer asymmetry.** Layers 2 and 3 are mutually independent: a bug in either does not compromise the other. Layer 1 is the trust root for the human-signature property. The RS has no path to re-verify the human's HMAC (it is not in the JWT claims), so an `OAuthVault` bug that mints without verifying the human signature would not be caught downstream. Layers 2 and 3 protect what happens *after* mint; Layer 1 protects whether mint should have happened at all.
+In a production deployment with client-side keys (such as WebAuthn), the consent page must be hosted in a separate trust domain from the agent bridge. If the agent bridge serves the consent UI, a compromised bridge could render misleading text in HTML while passing destructive command arguments to the browser's credential API. Hosting the consent page in a separate trust domain ensures the user reviews arguments rendered by a trusted service.
 
-### Constraint 3: Independent consent surface in production
+## Three deployment tiers
 
-Constraints 1, 2, and 4 are properties of code. Constraint 3 is a property of *deployment shape* and cannot be enforced by the bridge alone: the bridge is the entity the constraint is constraining.
+| Tier | Agent holds write credentials | Gate mechanism | Threat coverage | Infrastructure |
+| --- | --- | --- | --- | --- |
+| **Tier 0** | Yes | None | None | None |
+| **Tier 1** | Yes | In-process HMAC verification | Prompt injection, parameter drift | Single shared secret |
+| **Tier 2** | No | External delegation authority mint + RS validation | Agent process compromise, prompt injection, drift | delegation authority, OAuth resource server |
 
-The demo's URL-mode consent server (`bridge/consent/url_mode.py`) runs on the bridge process so the reference is self-contained. In that configuration, the `ProposedAction` is `frozen=True` + `MappingProxyType`, so the display and the signed bytes come from the same immutable record - the demo cannot drift the display by construction. The `binding_message` is also part of the canonical bytes, so even in a richer in-process configuration, a render-vs-sign drift produces a signature the Vault rejects (`tests/e2e/test_three_layer_enforcement.py::test_vault_rejects_binding_message_swap`).
+## Interactive authorization for agent workflows
 
-What none of those defences cover: a production deployment with WebAuthn / Passkey at the user, where the bridge ships JavaScript to the user's browser. The JS computes canonical bytes for the action and calls `navigator.credentials.get(...)` with that as the challenge. A hostile bridge can render "Read email" HTML while composing canonical bytes for "Delete database" and generating a matching `binding_message`. The user's signer signs honestly even though the user was deceived, so the signature verifies and the credential mints.
+Standard authorization servers evaluate requests against predefined attribute rules (ABAC). This works for predictable service-to-service calls, but fails when an LLM proposes unplanned destructive operations that cannot be anticipated in advance.
 
-The architectural fix is to put the consent surface in a different trust domain from the bridge - a separate authorization-server-hosted consent page that parses and renders the raw `(command, args)` itself, independent of any HTML the bridge supplies. The user's signer is then signing what the AS displays, not what the bridge displays. This is the standard FAPI 2.0 deployment shape and is the production form constraint 3 requires.
-
-The reference does not bundle a separate AS process because the architectural mechanics it teaches do not depend on the separation - the demo's frozen `ProposedAction` is the same property a separate AS would enforce, just inside one process. The production swap is a deployment-topology change, not a code change to the Vault contract.
-
-### The carrier for the multi-domain path
-
-`bridge.translation` is the carrier the reference ships for the multi-domain path: it translates between A2A's task-lifecycle SSE shape and MCP's elicitation shape so a sub-agent's pause can bubble up to the human's MCP host. It carries the signed approval without touching its meaning, which the three properties below guarantee:
-
-- **`context_id` continuity.** The MCP elicitation carries an `elicitation_id` derived from the A2A context, so the resume routes back to the paused action.
-- **`authorization_details` byte-identity.** The bridge does NOT re-canonicalise. What the agent proposed is exactly what the human signs.
-- **URL-mode elicitation.** Required by MCP 2025-11-25 for sensitive consent.
-
-The single-domain path needs none of this translation: a single MCP agent emits its own URL-mode elicitation and resumes on retry (`bridge/mcp/hitl.py`), with the consent hop going to a separate trust domain rather than to another agent. The translation layer earns its place only once a second agent's domain is in the chain.
-
-## Three deployment tiers, graduated by threat surface
-
-Most published bridges sit at Tier 0; going to Tier 1 closes the dominant threat at near-zero infrastructure cost. Going from Tier 1 to Tier 2 closes a real but secondary threat at significant infrastructure cost. Teams should pick deliberately.
-
-| | Tier 0 | Tier 1 | Tier 2 |
-|---|---|---|---|
-| Agent holds destructive creds? | Yes | Yes | No |
-| Gate location | None | In-process HMAC verifier | External Vault mint + RS validation |
-| Prompt injection / LLM drift | ❌ | ✅ | ✅ |
-| Agent-process compromise | ❌ | ❌ | ✅ |
-| Infrastructure required | None | None (one shared secret) | Vault, RAR-aware RS, OAuth client |
-| Reference implements | none | `InProcessVault` | `OAuthVault` + `JwtResourceServer` |
-
-## The interactive last-mile
-
-A Vault closes Zero Trust enforcement: short-lived, downscoped credentials, issued only when policy permits. But Vaults are designed for **non-interactive** authorization decisions. They evaluate a request against static attribute-based policies and answer "issue" or "deny." That model is correct for service-to-service calls where the policy can be predeclared. It is the *wrong* model for agentic workflows, where the LLM proposes contextual, sometimes novel destructive actions that cannot all be encoded as static ABAC rules in advance.
-
-IBM Verify frames this as the **agentic last-mile problem**: the gap between high-level agent reasoning and grounded backend infrastructure, where the database, message broker, or production system has no way to know who the original human was or what they intended.
-
-**The bridge resolves this gap by turning the human into the Vault's dynamic policy engine.** Instead of asking the Vault to evaluate a contextual destructive action from static attributes alone, the bridge intercepts the agent's `auth_required` event, surfaces the proposed action to the human via MCP elicitation, and accepts a signed RAR payload as the human's *just-in-time* policy decision. The Vault no longer guesses - it mints single-use tokens backed by explicit human delegation for exactly the operation the human approved.
-
-A Vault enforces Zero Trust over decisions a static policy can encode in advance. The bridge adds *interactive* Zero Trust: the same enforcement for the contextual, human-approved actions an LLM proposes that no static policy can anticipate.
-
-## Related work
-
-The MCP elicitation primitive as an authorization-gate idea has been independently surfaced. The most concrete prior work is an **individual IETF submission**, [`draft-embesozzi-oauth-agent-native-authorization-00`](https://datatracker.ietf.org/doc/draft-embesozzi-oauth-agent-native-authorization/) (M. Besozzi, TwoGenIdentity, 2026-04-03). The draft extends OAuth 2.0 First-Party Applications with a structured-elicitations array using MCP Elicitation as the normative binding for delivering **authenticator challenges** (TOTP, WebAuthn, push notification) to a human via an agent.
-
-Standardization status caveat: this is an *individual* IETF draft (`draft-<author>-...`), not a working-group draft (`draft-ietf-<wg>-...`). The draft is citable - the citation weight is "another team is thinking along similar lines," not "the IETF is converging on this."
-
-The scope distinction is informative:
-
-| | Besozzi draft (individual submission) | This work |
-|---|---|---|
-| Elicitation carries | Authenticator challenges (TOTP/WebAuthn/push) | Action-approval payloads (RAR `authorization_details`) |
-| Question answered by the elicitation | "Prove this is the user" (identity step-up) | "Did this user approve this specific action with these parameters?" |
-| Vault-style cryptographic delegation | Out of scope; agent acts as FiPA client | Tier 2: agent holds no destructive credentials |
-
-The two efforts are complementary. A complete enterprise deployment plausibly wants both: Besozzi's pattern for *"is this the right human, freshly authenticated?"* and this work's pattern for *"did this human approve this specific destructive action?"* They compose at the MCP elicitation layer.
+When an agent needs to execute an unconfigured or sensitive tool, the bridge pauses execution, renders the exact arguments to the human via MCP elicitation, and submits the resulting signed payload to the delegation authority. The human acts as the dynamic decision-maker, allowing the delegation authority to mint short-lived credentials for arbitrary, contextual actions.
 
 ## What this rationale commits the design to
 
-This page commits the bridge design to the four constraints at the top of this document - parameter-bound intent, consent atomicity, independent consent surface (production deployment), destination gating - plus three protocol-level properties:
+The four constraints above, plus three protocol-level properties:
 
-- **Stateful.** `context_id` continuity across MCP tool calls. *All tiers.*
-- **HITL-aware.** `auth_required` SSE event translated to MCP elicitation, with resume-via-`message:send`. *All tiers above Tier 0.*
-- **Translation-only, not policy-bearing.** The bridge translates between protocol envelopes but does not make authorization decisions. At Tier 2 this strengthens to *delegation-engine*: the bridge presents the human's signed approval to a Vault and receives a freshly-minted, single-use, action-scoped token. The agent holds no persistent destructive credentials between transactions.
+- **Stateful `context_id` continuity** across MCP tool calls. All tiers.
+- **HITL-aware pause/resume.** `auth_required` events translate to MCP elicitations; resume carries the signed payload back. All tiers above Tier 0.
+- **Translation-only bridge.** The bridge translates between protocol envelopes but makes no authorization decisions. At Tier 2 this strengthens to delegation-engine: the bridge presents the human's signed approval to a delegation authority and receives a single-use, action-scoped token. The agent holds no persistent destructive credentials between transactions.
 
-See `architecture.md` for the components, flows, and threat model that hold these properties.
+See `docs/architecture.md` for the components, flows, and threat model that hold these properties.
+
+## Related work
+
+The MCP elicitation primitive has also been explored in [`draft-embesozzi-oauth-agent-native-authorization-00`](https://datatracker.ietf.org/doc/draft-embesozzi-oauth-agent-native-authorization/) (M. Besozzi, 2026). That draft uses MCP elicitation to deliver user authentication challenges (such as TOTP or WebAuthn identity step-up) through an agent.
+
+By contrast, this reference uses MCP elicitation to authorize specific tool actions with exact parameters (RAR `authorization_details`). Both patterns can compose together: Besozzi's approach verifies user identity, while this reference authorizes specific destructive actions.

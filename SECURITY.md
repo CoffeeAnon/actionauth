@@ -1,52 +1,48 @@
 # Security policy
 
-## Reporting
+## Reporting vulnerabilities
 
-This is a reference implementation. If you find a *pattern-level* flaw - i.e. the architecture as documented (the Vault contract, three-layer enforcement, canonical-bytes shape, A2A↔MCP translation) teaches something incorrect or unsafe - please open an issue. Pattern-level corrections are exactly what the repo exists to attract.
+This is a reference architecture. If you find a flaw in the design (such as the delegation authority contract, three-layer enforcement, canonical byte serialization, or protocol translation), please open an issue.
 
-For *substrate-level* findings (the consent server lacks CSRF tokens, the token store has a race, the audit log stores PII in plaintext), please cross-reference "Intentional Omissions" below before filing. Most of these are documented non-goals; an issue is still welcome if you believe one is mis-classified.
+For missing production infrastructure (such as CSRF protection, persistent session storage, or audit log encryption), check "Intentional omissions" below before filing. These are deliberate omissions to keep the reference code focused and readable.
 
-There is no production deployment to coordinate disclosure with. Public issues are appropriate.
+There is no production deployment to coordinate disclosure with, so public issues are appropriate.
 
 ## Intentional omissions
 
-The reference deliberately leaves the following out of scope. Copying the repo as a template means re-introducing each of these from production-grade components.
+The reference deliberately leaves the following out of scope. Adopting this repository as a base requires implementing these with production-grade components.
 
-### Substrate concerns the reference will not address
+### Infrastructure not implemented in this reference
 
-These belong to the deployment substrate, not the architecture being taught. The reference will not add them even in a mature form.
+These items belong to general deployment infrastructure rather than the core authorization model:
 
-- **Consent-server user authentication.** Anyone with a session ID can render and submit the consent page. Production wraps the consent surface in OIDC / SAML.
-- **CSRF protection on `POST /consent/<id>/submit`.** No CSRF tokens. Production adds them at the substrate layer.
-- **Session hardening and rate limiting** on the consent server.
-- **Durable, transactional token store.** `bridge/auth/hmac.py`'s `TokenStore` is a JSON file with non-atomic load-modify-save. Concurrent issue requests may race.
-- **Audit-log PII handling.** `tool_args` and `result_snippet` are stored as-is in the SQLite audit log. No field-level encryption or scrubbing.
-- **DPoP / sender-constrained tokens** (RFC 9449).
-- **Multi-tenant federation.** Single Vault, single RS, single bridge.
-- **Untrusted-MCP-host hardening.** The reference targets cooperative MCP hosts the human controls. Cross-host routing safety requires a signed elicitation-ID carrier; see `bridge.translation.a2a_mcp`.
+- **User authentication on the consent server.** Anyone with a session ID can view and submit the consent form. Production setups must wrap the consent page in an identity provider (OIDC or SAML).
+- **CSRF protection.** `POST /consent/<id>/submit` lacks CSRF tokens.
+- **Session hardening and rate limiting.** The demo consent server does not rate-limit requests or harden cookies.
+- **Durable, transactional token storage.** `TokenStore` in `actionauth/auth/hmac.py` uses a JSON file without atomic transactions; concurrent writes can race.
+- **Audit log sensitive data handling.** `tool_args` and `result_snippet` are stored directly in SQLite without field-level encryption or automated scrubbing.
+- **Sender-constrained tokens (DPoP, RFC 9449).** Tokens are standard bearer tokens rather than proof-of-possession tokens.
+- **Multi-tenant federation.** The reference runs a single delegation authority, single resource server, and single bridge.
+- **Untrusted MCP host protection.** The reference assumes cooperative MCP hosts that the user controls. Running in a multi-tenant or untrusted host environment requires signed elicitation identifiers; see `actionauth.translation.a2a_mcp`.
 
-### Architectural gaps the bundled demo does not close
+### Production gaps in the demo implementation
 
-These are properties the architectural claim *does* commit to, but the bundled demo's substrate stops short of delivering. A production port must close each. They are also listed in the README under "Known production gaps".
+These properties are part of the target architecture, but the bundled demo uses simplified components:
 
-- **HS256 → RS256/ES256 + JWKS.** Symmetric secret co-located between Vault and RS in the demo.
-- **Server-side signer co-location.** `bridge.consent.demo_signer` holds the user signing key. Production moves signing client-side (WebAuthn / Passkey) and validates the submitted payload against the stored `ProposedAction`.
-- **In-memory consumed-jti set.** Vault/RS restart inside the JWT TTL discards the replay-tracking record.
-- ~~**Re-mint within signed-payload TTL.** Single-use is enforced per-jti (at consume), not per-signed-payload (at mint).~~ *Closed:* both `InProcessVault` and `OAuthVault` track canonical-bytes hashes of signed payloads accepted at mint and raise `SignatureReplay` on the second presentation. One human signature exchanges for at most one credential, even within the signed-payload TTL. See `tests/unit/test_oauth_vault.py::test_mint_rejects_signature_replay`, `tests/unit/test_in_process_vault.py::test_mint_rejects_signature_replay`, and `tests/e2e/test_dispatcher_vault_integration.py::test_tier2_captured_signed_payload_cannot_be_reminted`.
-- **Independent consent surface in production.** The demo's URL-mode consent server runs on the bridge process (`bridge/consent/url_mode.py`) because the demo is self-contained. In production, an entity that orchestrates the LLM (the bridge) cannot also host the page that displays the action to the human - if it controls the pixels, it can render one action and ask the user's signer to sign different bytes, and the `binding_message` defence only catches that *forensically* once the signature is examined. The consent URL must point at an authorization server / consent host in a separate trust domain from the bridge. The reference's `ProposedAction` immutability (`frozen=True` + `MappingProxyType`) is sufficient for the demo's server-side signer but not for a production WebAuthn deployment, where the bridge ships JS to the user's browser and could compose canonical bytes for an action different from the one it renders.
-- ~~**MCP scope enforcement.** `bridge/mcp/auth.py` is authentication-only.~~ *Closed:* `Dispatcher.execute` enforces `ToolSpec.required_scopes` against the caller's bearer scopes before HITL routing. See `bridge/core/dispatcher.py` and `tests/e2e/test_scope_enforcement.py`. Any non-MCP surface that bypasses the dispatcher must apply the same check itself.
-- ~~**Binding-message tampering.** The human-readable consent summary is not in the canonical bytes.~~ *Closed:* `binding_message` is now a required field of the canonical-bytes contract (CANONICAL.md `binding_message`). A bridge that renders one summary and signs different bytes produces a signature the Vault rejects. See `tests/e2e/test_three_layer_enforcement.py::test_vault_rejects_binding_message_swap`.
-- ~~**MCP elicitation emission.** Not bundled in `bridge/mcp/server.py`; demonstrated as building blocks in `tests/e2e/test_mcp_hitl_building_blocks.py`.~~ *Closed:* `bridge/mcp/server.py` emits a URL-mode elicitation (`URL_ELICITATION_REQUIRED`) on a HITL-gated `tools/call` and resumes on retry via `bridge/mcp/hitl.py`, the single-agent secure-approval path with no A2A. Gated tools surface only through an explicit `MCP_HITL_ALLOWLIST` and only when a HITL gate (consent store + Vault) is wired; otherwise the surface stays read-only. See `tests/e2e/test_mcp_elicitation_emission.py` and `tests/unit/test_mcp_hitl_gate.py`. The remaining demo-grade caveat is the in-process consent surface (see "Independent consent surface in production" above).
+- **Symmetric vs asymmetric keys (HS256 vs RS256/ES256).** The demo shares a symmetric secret between the delegation authority and resource server. Production setups should use asymmetric keys (RS256/ES256) with a published JWKS endpoint so the resource server only needs public verification keys.
+- **Signer location.** The demo uses `actionauth.consent.demo_signer` to generate signatures server-side. Production setups must move signing to the client (such as WebAuthn or Passkeys) and verify that the submitted payload matches the stored `ProposedAction` before minting tokens.
+- **In-memory replay state by default.** The default in-memory backend discards replay tracking records if the process restarts within the token lifetime. Operators should configure the file-backed `DurableReplayState` or a shared database for persistent tracking.
+- **Independent consent host.** The demo serves the consent page from the bridge process (`actionauth/consent/url_mode.py`). In production, the service orchestrating the LLM cannot also host the approval UI. The consent URL must point to an independent authorization server so the user reviews what the authorization server displays rather than HTML generated by the agent.
 
-## What the reference *does* defend, structurally
+## Architectural properties enforced by the codebase
 
-The architectural claim is exercised through code paths and tests, even though the substrate around it is demo-grade. See `tests/e2e/test_three_layer_enforcement.py`, `tests/e2e/test_dispatcher_vault_integration.py`, and `tests/e2e/test_mcp_hitl_building_blocks.py` for the core assertions:
+The following core properties are verified by tests (see `tests/e2e/test_three_layer_enforcement.py` and `tests/e2e/test_dispatcher_authority_integration.py`):
 
-- Vault refuses to mint without a valid human signature.
-- The bridge cannot alter the minted credential between Vault and RS.
-- The RS validates the credential's `authorization_details` against the live request independently of the Vault.
-- The `ProposedAction` between elicitation emission and signing is structurally immutable (`frozen=True` + `MappingProxyType`).
-- JWT algorithm pinning forecloses the `alg=none` and `RS256↔HS256` key-confusion families.
-- Canonical bytes are byte-locked across signers, including a non-ASCII fixture.
-
-A bug in any of these would be a pattern-level finding and is in-scope for issues.
+- The delegation authority refuses to mint tokens without a verified signature over canonical authorization bytes.
+- The bridge cannot alter minted credentials in transit without invalidating the token at the resource server.
+- The resource server validates `authorization_details` against the active request independently of the delegation authority.
+- `ProposedAction` parameters are immutable between elicitation emission and signature verification (`frozen=True` and `MappingProxyType`).
+- JWT algorithm pinning rejects unsigned (`alg=none`) tokens and algorithm-confusion attempts.
+- Canonical JSON serialization produces deterministic byte representations across languages, including non-ASCII characters.
+- One signature mints at most one credential; replay attempts fail at mint time.
+- Tool dispatch enforces required bearer scopes before routing requests to human approval.

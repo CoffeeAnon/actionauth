@@ -8,9 +8,9 @@ from dataclasses import replace
 
 import pytest
 
-from bridge import tools as tools_module
-from bridge.tools import SPECS_BY_NAME, TOOL_SPECS, ToolSpec
-from bridge.mcp.tools import MCP_HITL_ALLOWLIST, MCP_V1_ALLOWLIST, mcp_tool_specs
+from actionauth import tools as tools_module
+from actionauth.tools import SPECS_BY_NAME, TOOL_SPECS, ToolSpec
+from actionauth.mcp.tools import MCP_HITL_ALLOWLIST, MCP_V1_ALLOWLIST, mcp_tool_specs
 
 
 def test_allowlist_contains_only_read_tools():
@@ -62,10 +62,10 @@ def test_hitl_inclusion_still_excludes_gated_tool_not_in_hitl_allowlist(monkeypa
         rar_type="rogue",
     )
     monkeypatch.setattr(tools_module, "TOOL_SPECS", TOOL_SPECS + [rogue])
-    monkeypatch.setattr("bridge.mcp.tools.TOOL_SPECS", tools_module.TOOL_SPECS)
+    monkeypatch.setattr("actionauth.mcp.tools.TOOL_SPECS", tools_module.TOOL_SPECS)
     # Put it on the READ allowlist but NOT the HITL allowlist.
     monkeypatch.setattr(
-        "bridge.mcp.tools.MCP_V1_ALLOWLIST",
+        "actionauth.mcp.tools.MCP_V1_ALLOWLIST",
         frozenset(MCP_V1_ALLOWLIST | {"rogue_destructive"}),
     )
     exposed = {s.name for s in mcp_tool_specs(include_hitl=True)}
@@ -88,10 +88,10 @@ def test_defense_in_depth_rejects_hitl_tool_added_to_allowlist(monkeypatch):
     monkeypatch.setattr(tools_module, "TOOL_SPECS", TOOL_SPECS + [rogue])
     monkeypatch.setattr(tools_module, "SPECS_BY_NAME", {**SPECS_BY_NAME, rogue.name: rogue})
     monkeypatch.setattr(
-        "bridge.mcp.tools.MCP_V1_ALLOWLIST",
+        "actionauth.mcp.tools.MCP_V1_ALLOWLIST",
         frozenset(MCP_V1_ALLOWLIST | {"rogue_destructive"}),
     )
-    monkeypatch.setattr("bridge.mcp.tools.TOOL_SPECS", tools_module.TOOL_SPECS)
+    monkeypatch.setattr("actionauth.mcp.tools.TOOL_SPECS", tools_module.TOOL_SPECS)
     exposed = {s.name for s in mcp_tool_specs()}
     assert "rogue_destructive" not in exposed, (
         "MCP surface must not expose HITL-gated tools even if they are mistakenly "
