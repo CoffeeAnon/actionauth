@@ -3,7 +3,7 @@
 Locks down the byte-level output of ``canonical_authorization_bytes`` and
 the HMAC signature for a set of known inputs. If the Python implementation
 ever drifts from these fixtures, the test fails immediately — preventing
-silent divergence from the spec at ``bridge/vault/CANONICAL.md``.
+silent divergence from the spec at ``actionauth/authority/CANONICAL.md``.
 
 These fixtures are the contract a non-Python signer must match. A JS or
 Rust signer that produces the same canonical bytes for the same inputs
@@ -15,7 +15,7 @@ and ``CANONICAL.md`` in the same commit and bump the version field.
 import hashlib
 import hmac
 
-from bridge.vault.in_process import (
+from actionauth.authority.in_process import (
     canonical_authorization_bytes,
     sign_authorization_details,
 )
@@ -231,7 +231,7 @@ def test_canonical_changes_when_binding_message_differs():
     """Binding-message tampering: ``binding_message`` is in the canonical
     bytes, so two payloads identical except for the human-readable
     summary produce different signatures. A compromised bridge that
-    renders one message and signs different bytes will fail Vault
+    renders one message and signs different bytes will fail delegation authority
     verification.
     """
     base = canonical_authorization_bytes(

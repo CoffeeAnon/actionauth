@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from bridge.audit import AuditRow, AuditSink
+from actionauth.audit import AuditRow, AuditSink
 
 
 def _read_rows(db_path) -> list[dict]:

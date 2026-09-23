@@ -3,31 +3,44 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "a2a-mcp-bridge-reference"
+name = "actionauth"
 version = "0.1.0"
-description = "Reference implementation of a stateful, HITL-aware A2A↔MCP bridge with parameter-bound authorization."
+description = "ActionAuth: a stateful, HITL-aware A2A↔MCP bridge with parameter-bound authorization."
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # Core: stdlib-only.
-# The Vault, RS, dispatcher, commands, CLI, and walkthrough require
+# The delegation authority, RS, dispatcher, commands, CLI, and walkthrough require
 # zero third-party packages.
 dependencies = []
 
 [project.scripts]
-bridge = "bridge.cli:main"
+actionauth = "actionauth.cli:main"
 
 [project.optional-dependencies]
-# MCP HTTP surface (bridge.mcp.*) and URL-mode consent server
-# (bridge.consent.url_mode). Pulls in Starlette + uvicorn + the
+# MCP HTTP surface (actionauth.mcp.*) and URL-mode consent server
+# (actionauth.consent.url_mode). Pulls in Starlette + uvicorn + the
 # Anthropic MCP SDK. Required if you want to expose the protocol
 # endpoints; the CLI demos run without it.
 mcp = [
-    "mcp>=1.0",
+    # 2026-07-28 stateless protocol. The 1.x decorator API
+    # (@server.list_tools / @server.call_tool) was removed in 2.0.0;
+    # actionauth.mcp.server now uses add_request_handler + InputRequiredResult
+    # for MRTR.
+    "mcp>=2.0",
     "starlette>=0.37",
     "uvicorn>=0.30",
-    "python-multipart>=0.0.9",   # required by Starlette's form parsing in bridge.consent.url_mode
+    "python-multipart>=0.0.9",   # required by Starlette's form parsing in actionauth.consent.url_mode
 ]
+# Known limitation of mcp 2.0.0: the lowlevel Server (used directly by
+# actionauth.mcp.server) does NOT auto-wire the RequestStateBoundary middleware
+# that the higher-level mcpserver framework installs. requestState is
+# therefore an opaque string on the wire — the bridge treats it as an
+# opaque continuation token keyed into DurableConsentStore, which is
+# acceptable for this reference (the token is validated by lookup, not
+# by cryptographic unsealing). If a future mcp release wires the boundary
+# into the lowlevel Server, upgrade the requirement and drop the token
+# from the wire.
 # Test runner.
 dev = [
     "pytest>=8",
@@ -36,7 +49,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["bridge*"]
+include = ["actionauth*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
